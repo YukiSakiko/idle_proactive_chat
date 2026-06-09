@@ -53,6 +53,20 @@ class FakeChat:
         }
 
 
+class FailingChat(FakeChat):
+    async def open_session(self, **kwargs: Any) -> dict[str, Any]:
+        self.open_calls.append(kwargs)
+        raise AssertionError("on_load 不应同步打开或创建聊天流")
+
+
+class PartiallyFailingChat(FakeChat):
+    async def open_session(self, **kwargs: Any) -> dict[str, Any]:
+        target_id = kwargs.get("group_id") or kwargs.get("user_id")
+        if target_id == "bad":
+            raise TimeoutError("模拟聊天流解析超时")
+        return await super().open_session(**kwargs)
+
+
 class FakeMessage:
     def __init__(self, messages: list[dict[str, Any]] | None = None) -> None:
         self.messages = messages or []
@@ -91,6 +105,24 @@ class FakeContext:
         self.maisaka = FakeMaisaka(trigger_result)
 
 
+class FakeTask:
+    def done(self) -> bool:
+        return False
+
+    def cancel(self) -> None:
+        return None
+
+
+class FakeAsyncioModule:
+    def __init__(self) -> None:
+        self.created_tasks: list[str] = []
+
+    def create_task(self, coro: Any) -> FakeTask:
+        self.created_tasks.append(getattr(getattr(coro, "cr_code", None), "co_name", "unknown"))
+        coro.close()
+        return FakeTask()
+
+
 def make_plugin(tmp_path: Path, *, target_chats: list[str] | None = None) -> IdleProactiveChatPlugin:
     plugin = IdleProactiveChatPlugin(state_path=tmp_path / "state.json")
     config = IdleProactiveChatPlugin.build_default_config()
@@ -123,6 +155,23 @@ def test_quiet_hours_supports_normal_and_cross_midnight_windows() -> None:
 def test_compute_required_idle_seconds_uses_exponential_backoff_with_cap() -> None:
     values = [compute_required_idle_seconds(7200, 2.0, 86400, attempts) for attempts in range(6)]
     assert values == [7200, 14400, 28800, 57600, 86400, 86400]
+
+
+def test_on_load_defers_target_resolution_to_background_task(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import plugin as plugin_module
+
+    fake_asyncio = FakeAsyncioModule()
+    monkeypatch.setattr(plugin_module, "_asyncio", fake_asyncio)
+    plugin = make_plugin(tmp_path, target_chats=["qq:private:123"])
+    ctx = FakeContext()
+    ctx.chat = FailingChat()
+    plugin._set_context(ctx)
+
+    run(plugin.on_load())
+
+    assert ctx.chat.open_calls == []
+    assert "_resolve_target_chats_safely" in fake_asyncio.created_tasks
+    assert "_schedule_loop" in fake_asyncio.created_tasks
 
 
 def test_receive_hook_updates_last_inbound_and_resets_backoff(tmp_path: Path) -> None:
@@ -184,6 +233,19 @@ def test_resolve_targets_opens_session_and_restores_latest_user_message(tmp_path
     assert ctx.message.calls[0]["limit"] == 1
     assert ctx.message.calls[0]["limit_mode"] == "latest"
     assert plugin._states["stream:group:123"].last_inbound_at == 900.25
+
+
+def test_resolve_targets_skips_failed_target_and_keeps_other_targets(tmp_path: Path) -> None:
+    plugin = make_plugin(tmp_path, target_chats=["qq:group:bad", "qq:group:123"])
+    ctx = FakeContext(messages=[{"timestamp": "900.25"}])
+    ctx.chat = PartiallyFailingChat()
+    plugin._set_context(ctx)
+
+    run(plugin._resolve_target_chats(now=1000.0))
+
+    assert [call.get("group_id") for call in ctx.chat.open_calls] == ["123"]
+    assert "stream:group:123" in plugin._resolved_chats
+    assert plugin._target_key_to_stream_id == {"qq:group:123": "stream:group:123"}
 
 
 def test_check_once_triggers_only_one_due_chat_with_maisaka_payload(tmp_path: Path) -> None:

@@ -138,6 +138,7 @@ class ScheduleConfig(PluginConfigBase):
 
     check_interval_seconds: int = Field(default=300, ge=10, description="后台检查间隔，单位秒")
     max_triggers_per_check: int = Field(default=1, ge=1, description="每轮检查最多触发几个聊天流")
+    target_resolve_timeout_seconds: int = Field(default=20, ge=1, description="解析单个聊天流目标的超时时间，单位秒")
 
 
 class QuietHoursConfig(PluginConfigBase):
@@ -238,16 +239,17 @@ class IdleProactiveChatPlugin(MaiBotPlugin):
         self._states: dict[str, ChatState] = {}
         self._resolved_chats: dict[str, ResolvedChat] = {}
         self._target_key_to_stream_id: dict[str, str] = {}
+        self._target_resolve_task: Any = None
         self._scheduler_task: Any = None
 
     async def on_load(self) -> None:
-        """加载状态、解析白名单，并启动后台调度。"""
+        """加载状态并启动后台调度。"""
 
         self._load_states()
-        await self._resolve_target_chats(now=time.time())
         if self.config.plugin.enabled and _asyncio is not None:
+            self._ensure_target_resolve_task()
             self._scheduler_task = _asyncio.create_task(self._schedule_loop())
-            self._get_logger().info("静默主动发言插件已加载，后台调度已启动")
+            self._get_logger().info("静默主动发言插件已加载，目标解析和后台调度已启动")
             return
         if _asyncio is None:
             self._get_logger().warning("当前运行时无法导入 asyncio，静默主动发言后台调度未启动")
@@ -257,6 +259,11 @@ class IdleProactiveChatPlugin(MaiBotPlugin):
     async def on_unload(self) -> None:
         """停止后台任务并保存状态。"""
 
+        if self._target_resolve_task is not None and not self._target_resolve_task.done():
+            self._target_resolve_task.cancel()
+            with contextlib.suppress(_CANCELLED_ERROR):
+                await self._target_resolve_task
+        self._target_resolve_task = None
         if self._scheduler_task is not None and not self._scheduler_task.done():
             self._scheduler_task.cancel()
             with contextlib.suppress(_CANCELLED_ERROR):
@@ -269,7 +276,11 @@ class IdleProactiveChatPlugin(MaiBotPlugin):
         """处理配置热重载。"""
 
         del config_data
-        await self._resolve_target_chats(now=time.time())
+        if self.config.plugin.enabled:
+            self._ensure_target_resolve_task()
+        else:
+            self._resolved_chats = {}
+            self._target_key_to_stream_id = {}
         self._save_states()
         self._get_logger().info("静默主动发言配置已更新: scope=%s, version=%s", scope, version)
 
@@ -315,6 +326,29 @@ class IdleProactiveChatPlugin(MaiBotPlugin):
                 self._get_logger().error("静默主动发言调度异常: %s", exc, exc_info=True)
                 await _asyncio.sleep(60)
 
+    def _ensure_target_resolve_task(self) -> None:
+        """确保目标聊天流解析在后台执行，不阻塞插件加载或热重载。"""
+
+        if _asyncio is None or not self.config.plugin.enabled:
+            return
+        if not self.config.targets.target_chats:
+            self._resolved_chats = {}
+            self._target_key_to_stream_id = {}
+            return
+        if self._target_resolve_task is not None and not self._target_resolve_task.done():
+            return
+        self._target_resolve_task = _asyncio.create_task(self._resolve_target_chats_safely())
+
+    async def _resolve_target_chats_safely(self) -> None:
+        """后台安全解析目标聊天流，避免异常影响插件加载状态。"""
+
+        try:
+            await self._resolve_target_chats(now=time.time())
+        except _CANCELLED_ERROR:
+            raise
+        except Exception as exc:
+            self._get_logger().error("后台解析主动发言目标失败: %s", exc, exc_info=True)
+
     async def _resolve_target_chats(self, *, now: float | None = None) -> None:
         """把配置目标解析为真实聊天流。"""
 
@@ -328,7 +362,11 @@ class IdleProactiveChatPlugin(MaiBotPlugin):
                 self._get_logger().warning("忽略无效主动发言目标配置: %s", raw_target)
                 continue
 
-            stream = await self._open_target_session(target)
+            try:
+                stream = await self._open_target_session(target)
+            except Exception as exc:
+                self._get_logger().warning("主动发言目标解析失败: target=%s error=%s", target.key, exc)
+                continue
             stream_id = self._extract_stream_id_from_stream(stream)
             if not stream_id:
                 self._get_logger().warning("主动发言目标未解析到聊天流: %s", target.key)
@@ -355,12 +393,22 @@ class IdleProactiveChatPlugin(MaiBotPlugin):
     async def _open_target_session(self, target: ChatTarget) -> Any:
         """按平台目标打开或创建聊天流。"""
 
-        return await self.ctx.chat.open_session(
+        open_session_coro = self.ctx.chat.open_session(
             platform=target.platform,
             chat_type=target.chat_type,
             group_id=target.target_id if target.chat_type == "group" else "",
             user_id=target.target_id if target.chat_type == "private" else "",
         )
+        if _asyncio is None:
+            return await open_session_coro
+
+        try:
+            _asyncio.get_running_loop()
+        except RuntimeError:
+            return await open_session_coro
+
+        timeout_seconds = max(1, int(self.config.schedule.target_resolve_timeout_seconds))
+        return await _asyncio.wait_for(open_session_coro, timeout=timeout_seconds)
 
     async def _restore_latest_inbound_at(self, stream_id: str, *, now: float) -> float:
         """从历史消息恢复最近一次非 Bot 入站消息时间。"""
@@ -390,7 +438,8 @@ class IdleProactiveChatPlugin(MaiBotPlugin):
         if not self.config.plugin.enabled:
             return 0
         if not self._resolved_chats and self.config.targets.target_chats:
-            await self._resolve_target_chats(now=now)
+            self._ensure_target_resolve_task()
+            return 0
         if self._is_quiet_now(now=now):
             return 0
 
