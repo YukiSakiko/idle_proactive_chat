@@ -297,6 +297,46 @@ def test_receive_hook_updates_last_inbound_and_resets_backoff(tmp_path: Path) ->
     assert state.backoff_attempts == 0
 
 
+def test_receive_hook_rebinds_target_to_actual_message_stream(tmp_path: Path) -> None:
+    plugin = make_plugin(tmp_path, target_chats=["qq:private:3103908461"])
+    ctx = FakeContext()
+    plugin._set_context(ctx)
+    old_chat = ResolvedChat(
+        target=ChatTarget("qq", "private", "3103908461"),
+        stream_id="empty-private-stream",
+        display_name="qq:private:3103908461",
+    )
+    plugin._resolved_chats = {"empty-private-stream": old_chat}
+    plugin._target_key_to_stream_id = {"qq:private:3103908461": "empty-private-stream"}
+    plugin._states["empty-private-stream"] = ChatState(
+        last_inbound_at=100.0,
+        waiting_for_reply=True,
+        backoff_attempts=3,
+    )
+
+    run(
+        plugin.handle_before_process(
+            {
+                "session_id": "real-private-stream",
+                "timestamp": "500.5",
+                "platform": "qq",
+                "is_notify": False,
+                "message_info": {
+                    "user_info": {"user_id": "3103908461", "user_nickname": "晴空"},
+                },
+            }
+        )
+    )
+
+    assert "empty-private-stream" not in plugin._resolved_chats
+    assert plugin._resolved_chats["real-private-stream"].target == ChatTarget("qq", "private", "3103908461")
+    assert plugin._resolved_chats["real-private-stream"].display_name == "晴空"
+    assert plugin._target_key_to_stream_id == {"qq:private:3103908461": "real-private-stream"}
+    assert plugin._states["real-private-stream"].last_inbound_at == 500.5
+    assert plugin._states["real-private-stream"].waiting_for_reply is False
+    assert plugin._states["real-private-stream"].backoff_attempts == 0
+
+
 def test_resolve_targets_opens_session_and_restores_latest_user_message(tmp_path: Path) -> None:
     plugin = make_plugin(tmp_path, target_chats=["qq:group:123"])
     ctx = FakeContext(messages=[{"timestamp": "900.25"}])

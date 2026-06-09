@@ -652,7 +652,67 @@ class IdleProactiveChatPlugin(MaiBotPlugin):
         target_key = self._extract_target_key_from_message(message)
         if not target_key:
             return ""
-        return self._target_key_to_stream_id.get(target_key, "")
+        mapped_stream_id = self._target_key_to_stream_id.get(target_key, "")
+        if stream_id and mapped_stream_id and stream_id != mapped_stream_id:
+            return self._rebind_target_stream_from_message(
+                target_key=target_key,
+                old_stream_id=mapped_stream_id,
+                new_stream_id=stream_id,
+                message=message,
+            )
+        return mapped_stream_id
+
+    def _rebind_target_stream_from_message(
+        self,
+        *,
+        target_key: str,
+        old_stream_id: str,
+        new_stream_id: str,
+        message: dict[str, Any],
+    ) -> str:
+        """收到真实消息流时，把白名单目标从旧空壳流迁移到真实 stream_id。"""
+
+        old_chat = self._resolved_chats.get(old_stream_id)
+        if old_chat is None:
+            return old_stream_id
+
+        display_name = self._extract_display_name_from_message(message, old_chat.target) or old_chat.display_name
+        self._resolved_chats.pop(old_stream_id, None)
+        self._resolved_chats[new_stream_id] = ResolvedChat(
+            target=old_chat.target,
+            stream_id=new_stream_id,
+            display_name=display_name or old_chat.target.key,
+            resolved_at=time.time(),
+        )
+        self._target_key_to_stream_id[target_key] = new_stream_id
+        self._migrate_state_to_stream(old_stream_id=old_stream_id, new_stream_id=new_stream_id)
+        self._get_logger().info(
+            "主动发言目标已迁移到真实聊天流: target=%s old_stream_id=%s new_stream_id=%s",
+            target_key,
+            old_stream_id,
+            new_stream_id,
+        )
+        return new_stream_id
+
+    def _migrate_state_to_stream(self, *, old_stream_id: str, new_stream_id: str) -> None:
+        """把旧 stream_id 上的静默状态迁移到新 stream_id。"""
+
+        if old_stream_id == new_stream_id:
+            return
+        old_state = self._states.pop(old_stream_id, None)
+        if old_state is None:
+            return
+
+        new_state = self._states.get(new_stream_id)
+        if new_state is None:
+            self._states[new_stream_id] = old_state
+            return
+
+        new_state.last_inbound_at = max(new_state.last_inbound_at, old_state.last_inbound_at)
+        new_state.last_trigger_at = max(new_state.last_trigger_at, old_state.last_trigger_at)
+        new_state.waiting_for_reply = new_state.waiting_for_reply or old_state.waiting_for_reply
+        new_state.backoff_attempts = max(new_state.backoff_attempts, old_state.backoff_attempts)
+        new_state.last_error_at = max(new_state.last_error_at, old_state.last_error_at)
 
     @staticmethod
     def _extract_stream_id_from_stream(stream_result: Any) -> str:
@@ -746,6 +806,25 @@ class IdleProactiveChatPlugin(MaiBotPlugin):
             user_id = str(user_info.get("user_id") or "").strip()
             if user_id:
                 return f"{platform}:private:{user_id}"
+        return ""
+
+    @staticmethod
+    def _extract_display_name_from_message(message: dict[str, Any], target: ChatTarget) -> str:
+        """从 Hook 消息中提取真实聊天流展示名。"""
+
+        message_info = message.get("message_info")
+        if not isinstance(message_info, dict):
+            return ""
+
+        if target.chat_type == "group":
+            group_info = message_info.get("group_info")
+            if isinstance(group_info, dict):
+                return str(group_info.get("group_name") or "").strip()
+            return ""
+
+        user_info = message_info.get("user_info")
+        if isinstance(user_info, dict):
+            return str(user_info.get("user_nickname") or user_info.get("user_cardname") or "").strip()
         return ""
 
     def _get_state(self, stream_id: str, *, default_last_inbound_at: float = 0.0) -> ChatState:

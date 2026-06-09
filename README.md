@@ -6,6 +6,7 @@
 
 - 只监控 `targets.target_chats` 配置的白名单目标。
 - 优先绑定已经存在的真实聊天流；找不到时才通过 `chat.open_session` 打开或创建，不自行计算 `session_id`。
+- 收到白名单目标的真实消息时，会自动把旧空壳流迁移到真实 `session_id`。
 - 使用 `chat.receive.before_process` 的观察型 Hook 记录入站活跃度，不拦截、不改写消息。
 - 默认静默 2 小时后允许触发主动任务。
 - 主动发言后若无人回复，会按 2 倍指数退避，最长 24 小时。
