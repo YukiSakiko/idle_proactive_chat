@@ -37,6 +37,15 @@ def run(coro: Any) -> Any:
 class FakeChat:
     def __init__(self) -> None:
         self.open_calls: list[dict[str, Any]] = []
+        self.lookup_calls: list[dict[str, Any]] = []
+
+    async def get_stream_by_group_id(self, group_id: str, platform: str = "qq") -> dict[str, Any]:
+        self.lookup_calls.append({"method": "get_stream_by_group_id", "group_id": group_id, "platform": platform})
+        return {"success": True, "stream": None}
+
+    async def get_stream_by_user_id(self, user_id: str, platform: str = "qq") -> dict[str, Any]:
+        self.lookup_calls.append({"method": "get_stream_by_user_id", "user_id": user_id, "platform": platform})
+        return {"success": True, "stream": None}
 
     async def open_session(self, **kwargs: Any) -> dict[str, Any]:
         self.open_calls.append(kwargs)
@@ -65,6 +74,48 @@ class PartiallyFailingChat(FakeChat):
         if target_id == "bad":
             raise TimeoutError("模拟聊天流解析超时")
         return await super().open_session(**kwargs)
+
+
+class ExistingPrivateChat(FakeChat):
+    async def get_stream_by_user_id(self, user_id: str, platform: str = "qq") -> dict[str, Any]:
+        self.lookup_calls.append({"method": "get_stream_by_user_id", "user_id": user_id, "platform": platform})
+        return {
+            "success": True,
+            "stream": {
+                "stream_id": "real-private-stream",
+                "session_id": "real-private-stream",
+                "user_id": user_id,
+                "user_nickname": "晴空",
+                "account_id": "2258194944",
+            },
+        }
+
+
+class DuplicatePrivateStreamsChat(FakeChat):
+    async def get_private_streams(self, platform: str = "qq") -> dict[str, Any]:
+        self.lookup_calls.append({"method": "get_private_streams", "platform": platform})
+        return {
+            "success": True,
+            "streams": [
+                {
+                    "stream_id": "empty-private-stream",
+                    "session_id": "empty-private-stream",
+                    "user_id": "3103908461",
+                    "user_nickname": "",
+                    "account_id": "",
+                },
+                {
+                    "stream_id": "real-private-stream",
+                    "session_id": "real-private-stream",
+                    "user_id": "3103908461",
+                    "user_nickname": "晴空",
+                    "account_id": "2258194944",
+                },
+            ],
+        }
+
+    async def get_stream_by_user_id(self, user_id: str, platform: str = "qq") -> dict[str, Any]:
+        raise AssertionError("存在候选列表时应直接选择最佳真实聊天流")
 
 
 class FakeMessage:
@@ -266,6 +317,36 @@ def test_resolve_targets_opens_session_and_restores_latest_user_message(tmp_path
     assert ctx.message.calls[0]["limit"] == 1
     assert ctx.message.calls[0]["limit_mode"] == "latest"
     assert plugin._states["stream:group:123"].last_inbound_at == 900.25
+
+
+def test_resolve_targets_prefers_existing_private_stream_without_opening_new_session(tmp_path: Path) -> None:
+    plugin = make_plugin(tmp_path, target_chats=["qq:private:3103908461"])
+    ctx = FakeContext(messages=[{"timestamp": "900.25"}])
+    ctx.chat = ExistingPrivateChat()
+    plugin._set_context(ctx)
+
+    run(plugin._resolve_target_chats(now=1000.0))
+
+    assert ctx.chat.lookup_calls == [
+        {"method": "get_stream_by_user_id", "user_id": "3103908461", "platform": "qq"}
+    ]
+    assert ctx.chat.open_calls == []
+    assert plugin._target_key_to_stream_id == {"qq:private:3103908461": "real-private-stream"}
+    assert plugin._resolved_chats["real-private-stream"].display_name == "晴空"
+
+
+def test_resolve_targets_prefers_real_private_stream_over_empty_duplicate(tmp_path: Path) -> None:
+    plugin = make_plugin(tmp_path, target_chats=["qq:private:3103908461"])
+    ctx = FakeContext(messages=[{"timestamp": "900.25"}])
+    ctx.chat = DuplicatePrivateStreamsChat()
+    plugin._set_context(ctx)
+
+    run(plugin._resolve_target_chats(now=1000.0))
+
+    assert ctx.chat.lookup_calls == [{"method": "get_private_streams", "platform": "qq"}]
+    assert ctx.chat.open_calls == []
+    assert plugin._target_key_to_stream_id == {"qq:private:3103908461": "real-private-stream"}
+    assert plugin._resolved_chats["real-private-stream"].display_name == "晴空"
 
 
 def test_resolve_targets_skips_failed_target_and_keeps_other_targets(tmp_path: Path) -> None:

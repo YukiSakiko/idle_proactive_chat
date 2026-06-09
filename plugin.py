@@ -397,7 +397,11 @@ class IdleProactiveChatPlugin(MaiBotPlugin):
         self._save_states()
 
     async def _open_target_session(self, target: ChatTarget) -> Any:
-        """按平台目标打开或创建聊天流。"""
+        """按平台目标优先查找已有聊天流，找不到时再打开或创建聊天流。"""
+
+        existing_stream = await self._get_existing_target_session(target)
+        if existing_stream is not None:
+            return existing_stream
 
         open_session_coro = self.ctx.chat.open_session(
             platform=target.platform,
@@ -405,16 +409,72 @@ class IdleProactiveChatPlugin(MaiBotPlugin):
             group_id=target.target_id if target.chat_type == "group" else "",
             user_id=target.target_id if target.chat_type == "private" else "",
         )
+        return await self._await_target_capability(open_session_coro)
+
+    async def _get_existing_target_session(self, target: ChatTarget) -> Any | None:
+        """优先按平台目标查找已存在的真实聊天流。"""
+
+        streams_result = await self._list_existing_target_sessions(target)
+        best_stream = self._select_best_target_stream(streams_result, target)
+        if best_stream is not None:
+            return best_stream
+
+        try:
+            if target.chat_type == "group":
+                result = await self._await_target_capability(
+                    self.ctx.chat.get_stream_by_group_id(target.target_id, platform=target.platform)
+                )
+            else:
+                result = await self._await_target_capability(
+                    self.ctx.chat.get_stream_by_user_id(target.target_id, platform=target.platform)
+                )
+        except AttributeError:
+            # 兼容较旧 SDK：没有按目标查找聊天流能力时再退回 open_session。
+            return None
+        except Exception as exc:
+            self._get_logger().warning("查找已有主动发言目标聊天流失败: target=%s error=%s", target.key, exc)
+            return None
+
+        if self._extract_stream_id_from_stream(result):
+            return result
+        return None
+
+    async def _list_existing_target_sessions(self, target: ChatTarget) -> list[dict[str, Any]]:
+        """列出当前平台同类型聊天流，供重复目标时选择真实流。"""
+
+        try:
+            if target.chat_type == "group":
+                result = await self._await_target_capability(self.ctx.chat.get_group_streams(platform=target.platform))
+            else:
+                result = await self._await_target_capability(self.ctx.chat.get_private_streams(platform=target.platform))
+        except AttributeError:
+            return []
+        except Exception as exc:
+            self._get_logger().warning("列出已有主动发言候选聊天流失败: target=%s error=%s", target.key, exc)
+            return []
+        return self._extract_streams(result)
+
+    def _select_best_target_stream(self, streams: list[dict[str, Any]], target: ChatTarget) -> dict[str, Any] | None:
+        """从候选聊天流中选择最像真实目标的一个。"""
+
+        matched_streams = [stream for stream in streams if self._stream_matches_target(stream, target)]
+        if not matched_streams:
+            return None
+        return max(matched_streams, key=lambda stream: self._score_target_stream(stream, target))
+
+    async def _await_target_capability(self, operation: Any) -> Any:
+        """等待单次目标解析能力调用，并在真实事件循环中加超时。"""
+
         if _asyncio is None:
-            return await open_session_coro
+            return await operation
 
         try:
             _asyncio.get_running_loop()
         except RuntimeError:
-            return await open_session_coro
+            return await operation
 
         timeout_seconds = max(1, int(self.config.schedule.target_resolve_timeout_seconds))
-        return await _asyncio.wait_for(open_session_coro, timeout=timeout_seconds)
+        return await _asyncio.wait_for(operation, timeout=timeout_seconds)
 
     async def _restore_latest_inbound_at(self, stream_id: str, *, now: float) -> float:
         """从历史消息恢复最近一次非 Bot 入站消息时间。"""
@@ -617,6 +677,42 @@ class IdleProactiveChatPlugin(MaiBotPlugin):
         if target.chat_type == "group":
             return str(stream.get("group_name") or target.key).strip()
         return str(stream.get("user_nickname") or stream.get("user_cardname") or target.key).strip()
+
+    @staticmethod
+    def _extract_streams(result: Any) -> list[dict[str, Any]]:
+        """从聊天流列表能力返回值中提取 stream 字典列表。"""
+
+        if isinstance(result, list):
+            return [stream for stream in result if isinstance(stream, dict)]
+        if isinstance(result, dict):
+            streams = result.get("streams") or result.get("result") or []
+            if isinstance(streams, list):
+                return [stream for stream in streams if isinstance(stream, dict)]
+        return []
+
+    @staticmethod
+    def _stream_matches_target(stream: dict[str, Any], target: ChatTarget) -> bool:
+        """判断候选聊天流是否匹配配置目标。"""
+
+        if target.chat_type == "group":
+            return str(stream.get("group_id") or "").strip() == target.target_id
+        return str(stream.get("user_id") or "").strip() == target.target_id
+
+    @staticmethod
+    def _score_target_stream(stream: dict[str, Any], target: ChatTarget) -> int:
+        """为候选聊天流打分，优先选择包含路由和展示信息的真实流。"""
+
+        score = 0
+        if str(stream.get("account_id") or "").strip():
+            score += 4
+        if str(stream.get("scope") or "").strip():
+            score += 2
+        if target.chat_type == "group":
+            if str(stream.get("group_name") or "").strip():
+                score += 1
+        elif str(stream.get("user_nickname") or stream.get("user_cardname") or "").strip():
+            score += 1
+        return score
 
     @staticmethod
     def _extract_messages(result: Any) -> list[dict[str, Any]]:
