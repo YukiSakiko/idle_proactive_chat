@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import logging
-import sys
 from pathlib import Path
 from typing import Any
+
+import json
+import logging
+import sys
 
 import pytest
 
@@ -19,6 +21,13 @@ from plugin import (  # noqa: E402
     is_in_quiet_hours,
     parse_target_chat,
 )
+
+REQUIRED_CHAT_RESOLUTION_CAPABILITIES = {
+    "chat.get_group_streams",
+    "chat.get_private_streams",
+    "chat.get_stream_by_group_id",
+    "chat.get_stream_by_user_id",
+}
 
 
 def run(coro: Any) -> Any:
@@ -191,6 +200,14 @@ def make_plugin(tmp_path: Path, *, target_chats: list[str] | None = None) -> Idl
     config["quiet_hours"]["enabled"] = False
     plugin.set_plugin_config(config)
     return plugin
+
+
+def test_manifest_declares_chat_resolution_capabilities() -> None:
+    manifest = json.loads((PLUGIN_ROOT / "_manifest.json").read_text(encoding="utf-8"))
+
+    missing_capabilities = REQUIRED_CHAT_RESOLUTION_CAPABILITIES - set(manifest["capabilities"])
+
+    assert not missing_capabilities, f"_manifest.json 缺少能力声明: {sorted(missing_capabilities)}"
 
 
 def test_parse_target_chat_accepts_group_and_private_targets() -> None:
