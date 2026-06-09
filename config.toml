@@ -1,0 +1,25 @@
+[plugin]
+enabled = true
+config_version = "1.0.0"
+
+[targets]
+target_chats = ["qq:group:123456"]
+
+[idle]
+idle_threshold_seconds = 7200
+backoff_multiplier = 2.0
+max_backoff_seconds = 86400
+failure_retry_seconds = 600
+
+[schedule]
+check_interval_seconds = 300
+max_triggers_per_check = 1
+
+[quiet_hours]
+enabled = true
+start = "00:00"
+end = "08:00"
+timezone = "Asia/Shanghai"
+
+[proactive]
+intent_template = "这个聊天流已经安静了 {idle_duration}。请结合当前人设、关系、记忆和最近上下文，自然地发起一句轻松的聊天或暖场。不要提到插件、定时任务、监控、静默检测等系统实现细节。"
