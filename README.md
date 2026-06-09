@@ -40,6 +40,7 @@ target_chats = ["qq:group:123456789", "qq:private:987654321"]
 | `idle.failure_retry_seconds` | `600` | 主动任务触发失败后的最小重试间隔 |
 | `schedule.check_interval_seconds` | `300` | 后台检查间隔 |
 | `schedule.max_triggers_per_check` | `1` | 每轮最多尝试触发的聊天流数量 |
+| `schedule.target_resolve_initial_delay_seconds` | `15` | 插件加载后首次解析白名单目标前的延迟，避免阻塞 Runner 就绪 |
 | `schedule.target_resolve_timeout_seconds` | `20` | 单个白名单目标解析聊天流的超时时间 |
 | `quiet_hours.enabled` | `true` | 是否启用免打扰 |
 | `quiet_hours.start` / `quiet_hours.end` | `00:00` / `08:00` | 免打扰时间段 |

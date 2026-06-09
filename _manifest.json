@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.0.1",
+  "version": "1.0.2",
   "name": "静默主动发言",
   "description": "当白名单聊天流长时间没有新入站消息时，通过 Maisaka 主动任务自然发起聊天。",
   "author": {

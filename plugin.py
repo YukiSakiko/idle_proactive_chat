@@ -138,6 +138,7 @@ class ScheduleConfig(PluginConfigBase):
 
     check_interval_seconds: int = Field(default=300, ge=10, description="后台检查间隔，单位秒")
     max_triggers_per_check: int = Field(default=1, ge=1, description="每轮检查最多触发几个聊天流")
+    target_resolve_initial_delay_seconds: int = Field(default=15, ge=0, description="加载后首次解析目标的延迟，单位秒")
     target_resolve_timeout_seconds: int = Field(default=20, ge=1, description="解析单个聊天流目标的超时时间，单位秒")
 
 
@@ -337,12 +338,17 @@ class IdleProactiveChatPlugin(MaiBotPlugin):
             return
         if self._target_resolve_task is not None and not self._target_resolve_task.done():
             return
-        self._target_resolve_task = _asyncio.create_task(self._resolve_target_chats_safely())
+        initial_delay_seconds = max(0, int(self.config.schedule.target_resolve_initial_delay_seconds))
+        self._target_resolve_task = _asyncio.create_task(
+            self._resolve_target_chats_safely(initial_delay_seconds=initial_delay_seconds)
+        )
 
-    async def _resolve_target_chats_safely(self) -> None:
+    async def _resolve_target_chats_safely(self, *, initial_delay_seconds: int = 0) -> None:
         """后台安全解析目标聊天流，避免异常影响插件加载状态。"""
 
         try:
+            if _asyncio is not None and initial_delay_seconds > 0:
+                await _asyncio.sleep(initial_delay_seconds)
             await self._resolve_target_chats(now=time.time())
         except _CANCELLED_ERROR:
             raise

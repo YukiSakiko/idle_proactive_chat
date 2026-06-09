@@ -123,6 +123,15 @@ class FakeAsyncioModule:
         return FakeTask()
 
 
+class SleepRecordingAsyncioModule(FakeAsyncioModule):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sleep_calls: list[int] = []
+
+    async def sleep(self, delay: int) -> None:
+        self.sleep_calls.append(delay)
+
+
 def make_plugin(tmp_path: Path, *, target_chats: list[str] | None = None) -> IdleProactiveChatPlugin:
     plugin = IdleProactiveChatPlugin(state_path=tmp_path / "state.json")
     config = IdleProactiveChatPlugin.build_default_config()
@@ -172,6 +181,30 @@ def test_on_load_defers_target_resolution_to_background_task(tmp_path: Path, mon
     assert ctx.chat.open_calls == []
     assert "_resolve_target_chats_safely" in fake_asyncio.created_tasks
     assert "_schedule_loop" in fake_asyncio.created_tasks
+
+
+def test_safe_target_resolution_waits_initial_delay_before_opening_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import plugin as plugin_module
+
+    fake_asyncio = SleepRecordingAsyncioModule()
+    monkeypatch.setattr(plugin_module, "_asyncio", fake_asyncio)
+    plugin = make_plugin(tmp_path, target_chats=["qq:group:123"])
+    ctx = FakeContext()
+    plugin._set_context(ctx)
+    events: list[str] = []
+
+    async def fake_resolve(*, now: float | None = None) -> None:
+        del now
+        events.append("resolve")
+
+    plugin._resolve_target_chats = fake_resolve  # type: ignore[method-assign]
+
+    run(plugin._resolve_target_chats_safely(initial_delay_seconds=15))
+
+    assert fake_asyncio.sleep_calls == [15]
+    assert events == ["resolve"]
 
 
 def test_receive_hook_updates_last_inbound_and_resets_backoff(tmp_path: Path) -> None:
